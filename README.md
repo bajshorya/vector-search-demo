@@ -1,12 +1,15 @@
-# Vector Search Demo — a minimal RAG retrieval pipeline
+# Vector Search Demo — a minimal RAG pipeline
 
-A small, **fully free, fully local** project that demonstrates the core of a
-**RAG (Retrieval-Augmented Generation)** system: how to make a real document
-**searchable by meaning** instead of by keywords.
+A small, **fully free, fully local** project that implements a complete
+**RAG (Retrieval-Augmented Generation)** pipeline: make a real document
+**searchable by meaning** instead of by keywords, then have an LLM **answer
+questions from it** — grounded in the retrieved passages, nothing else.
 
 You give it a natural-language question like *"how do I install pgvector on a
-Mac?"* and it returns the most **semantically similar** passages — even when they
-share no words with the question.
+Mac?"*. It retrieves the most **semantically similar** passages — even when they
+share no words with the question — and a local LLM (`llama3.2` via Ollama)
+writes a cited answer from them, or says *"I don't know"* when the document
+doesn't cover it.
 
 > **This README is the corpus.** The pipeline indexes *this very file*. Every
 > section below is chunked, embedded, and stored in Postgres — which means
@@ -55,9 +58,19 @@ The project is split into two phases, matching how every RAG system works.
   question's embedding.
 - Return the top 3.
 
-That's the "R" (Retrieval) in RAG. This project stops at retrieval — it finds the
-right passages. Adding an LLM to *generate* an answer from them would complete
-the full RAG loop (see [section 14](#14-where-to-go-next)).
+That's the "R" (Retrieval) in RAG — `npm run search` stops there so you can
+inspect the raw chunks and distances.
+
+**Online (every question) — generate a grounded answer:**
+
+- `npm run ask` runs the same retrieval, then wraps the top-3 chunks in a
+  prompt with strict grounding rules.
+- A **local LLM** (`llama3.2` served by Ollama) answers **only from those
+  chunks**, citing them inline as [1] [2] [3] — or replies *"I don't know based
+  on the indexed documents"* when they don't contain the answer.
+
+That's the "G" (Generation): the knowledge lives in Postgres, the LLM only
+reads and phrases it.
 
 ---
 
@@ -173,7 +186,7 @@ OFFLINE  (run once: `npm run embed`)
    INSERT INTO documents (content, embedding)     ──►  PostgreSQL + pgvector
                                                         (the knowledge base)
 
-ONLINE  (every search: `npm run search "..."`)
+ONLINE  (every question: `npm run ask "..."`)
 ──────────────────────────────────────────────
    user query (a sentence)
           │
@@ -187,10 +200,16 @@ ONLINE  (every search: `npm run search "..."`)
    SELECT ... ORDER BY embedding <=> queryVector LIMIT 3   ──►  PostgreSQL
           │
           ▼
-   top 3 most similar chunks
+   top 3 most similar chunks     ◄── `npm run search` stops here (Retrieve)
           │
           ▼
-   (an LLM would go here — see section 14)
+   buildPrompt()     (src/ask.ts — chunks wrapped in <chunk id="n"> tags,
+          │           grounding rules, the question last)
+          ▼
+   llama3.2          (local LLM served by Ollama at localhost:11434)
+          │
+          ▼
+   grounded, cited answer — or "I don't know" if the chunks lack it
 ```
 
 The single most important rule: **the query and the documents must be embedded by
@@ -213,15 +232,17 @@ distances are meaningless. That's why `search.ts` imports `embed()` from
 | **pgvector** | Postgres extension | Adds a `vector` column type and distance operators (`<->`, `<=>`) so similarity search is just SQL. |
 | **pg** | Node ↔ Postgres driver | Standard, well-documented PostgreSQL client for Node. |
 | **dotenv** | Config loading | Loads `DATABASE_URL` from `.env` so connection details aren't hard-coded. |
+| **Ollama** | Local LLM runtime | Serves open-weight models over HTTP at `localhost:11434`. **No API key, no cost, works offline** — same ethos as the embeddings. |
+| **llama3.2 (3B)** | The generation model | Small enough for a laptop CPU, capable enough to answer from 3 supplied chunks. Called with plain `fetch` — no SDK dependency. |
 
 Chunking has **no dependency** — it's ~120 lines of plain string handling in
 `src/chunk.ts`. Libraries exist (LangChain's `RecursiveCharacterTextSplitter` is
 the well-known one), but the whole idea is small enough to write yourself, and
 writing it yourself is how you learn what the parameters actually do.
 
-> **Note:** `openai` is still listed in `package.json` from an earlier version
-> that used the OpenAI embedding API. It is **no longer used** — embeddings are
-> now fully local. You can remove it with `npm uninstall openai`.
+> **No paid dependencies.** An earlier version used the OpenAI embedding API;
+> that package is gone. The entire pipeline — embeddings, database, LLM — now
+> runs locally with no API key.
 
 ### Why local embeddings instead of a paid API?
 
@@ -242,13 +263,15 @@ vector-search-demo/
 ├── src/
 │   ├── chunk.ts      # Splits a document into overlapping chunks. Exports chunkText().
 │   ├── embed.ts      # OFFLINE: chunks README.md, embeds each chunk, stores it. Exports embed().
-│   ├── search.ts     # ONLINE: embeds a query + finds the top 3 matching chunks.
+│   ├── search.ts     # ONLINE: embeds a query + finds the top 3 matching chunks. Exports search().
+│   ├── ask.ts        # ONLINE: full RAG — retrieval + a grounded answer from a local LLM.
 │   └── snippets.ts   # The OLD hand-written corpus. No longer used — kept for reference.
 ├── .env              # DATABASE_URL (no API key needed). Not committed.
 ├── .gitignore        # ignores node_modules/ and .env
 ├── package.json      # deps + `npm run embed` / `npm run search` scripts
 ├── tsconfig.json     # TypeScript config
-└── README.md         # this file — and also the document being indexed
+├── README.md         # this file — and also the document being indexed
+└── DOCUMENTATION.md  # deep-dive docs: every file and function explained
 ```
 
 `snippets.ts` is deliberately left in place: comparing it with the chunks that
@@ -273,6 +296,7 @@ Table "public.documents"
 - **Node.js** (v18+; v20+ recommended)
 - **PostgreSQL** (v14+ used here)
 - **pgvector** extension installed for your PostgreSQL version
+- **Ollama** with the `llama3.2` model (only for `npm run ask` — search works without it)
 
 ---
 
@@ -328,6 +352,16 @@ npm install
 
 ```
 DATABASE_URL=postgres://localhost:5432/vector_demo
+```
+
+No API key of any kind — every model in the pipeline runs locally.
+
+### 8.6 Install Ollama and pull the LLM
+
+```bash
+brew install ollama
+brew services start ollama   # or run `ollama serve` in a terminal
+ollama pull llama3.2         # ~2 GB, downloaded once
 ```
 
 ---
@@ -400,6 +434,42 @@ npm run search "how do I bake sourdough bread"
 the best match for a good query was ~0.58. With chunks, well-targeted queries
 land in the 0.34–0.45 range — because a chunk's vector represents *one* topic
 instead of averaging eight.
+
+### Step 3 — Ask (the full RAG loop, any time)
+
+```bash
+npm run ask "how do I choose the chunk size and overlap?"
+```
+
+This runs the same retrieval as Step 2, then hands the top 3 chunks to
+`llama3.2` with strict grounding rules and streams the answer:
+
+```
+🔎 Question: "how do I choose the chunk size and overlap?"
+📚 Retrieved 3 chunks:
+   [1] (distance 0.5345) 4. Architecture & data flow
+   [2] (distance 0.5461) start a new one. Because we only ever a…
+   [3] (distance 0.5866) Choosing size and overlap
+
+🤖 llama3.2 (local via Ollama):
+
+According to chunk 3, ... Chunk size: 900 chars (~225 tokens),
+Overlap: 150 chars (~17%) ... [3]
+
+— sources: [1] 4. Architecture & data flow  ·  [2] …  ·  [3] Choosing size and overlap
+```
+
+The grounding is testable: ask something this README doesn't cover, and the
+model refuses to fall back on its training knowledge:
+
+```bash
+npm run ask "what is the capital of France?"
+# -> "I don't know based on the indexed documents. The context does not
+#     provide information about the capital of France."
+```
+
+llama3.2 obviously *knows* the answer — the refusal proves the response comes
+from the retrieved chunks, not from the model's memory.
 
 ### A self-reference artifact worth understanding
 
@@ -604,9 +674,9 @@ same `embed()` and lets Postgres rank every stored vector against it:
 
 ```ts
 import { embed } from "./embed.js"; // SAME embedder used to index the documents
-const TOP_K = 3;
+export const TOP_K = 3;
 
-async function search(query: string) {
+export async function search(query: string, topK: number = TOP_K) {
   const db = new Client({ connectionString: process.env.DATABASE_URL });
   await db.connect();
 
@@ -627,9 +697,55 @@ async function search(query: string) {
 }
 ```
 
-The only edit chunking forced was cosmetic: results are now multi-line markdown
-rather than one-line snippets, so printing uses `chunkLabel()` for the heading
-and indents the body.
+`search()` is exported (with the same direct-run guard as `embed.ts`) so that
+`ask.ts` can reuse retrieval without triggering the CLI. Printing uses
+`chunkLabel()` for the heading and indents the multi-line chunk body.
+
+### `src/ask.ts` — generate the answer
+
+The generation half of RAG. It reuses `search()` for retrieval, then does three
+things:
+
+**1. Prompt + Context.** The chunks are wrapped in tagged blocks so the model
+can tell them apart and cite them by id, with the question placed last:
+
+```ts
+function buildPrompt(question: string, hits: SearchHit[]): string {
+  const context = hits
+    .map((hit, i) => `<chunk id="${i + 1}">\n${hit.content}\n</chunk>`)
+    .join("\n\n");
+  return `<context>\n${context}\n</context>\n\nQuestion: ${question}`;
+}
+```
+
+**2. Grounding rules.** A fixed system prompt orders the model to base every
+claim on the context, cite chunks inline as [1]/[2], and say *"I don't know
+based on the indexed documents"* instead of guessing. This is the line between
+RAG and a plain chatbot: the model's own knowledge is deliberately off-limits.
+
+**3. The LLM call.** Plain `fetch` to Ollama's `/api/chat` on localhost — no
+SDK. With `stream: true`, Ollama replies with NDJSON (one JSON object per
+line, each carrying a few tokens); the code buffers partial lines and prints
+fragments as they arrive, so the answer streams word by word:
+
+```ts
+const response = await fetch("http://localhost:11434/api/chat", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({
+    model: "llama3.2",
+    stream: true,
+    messages: [
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "user", content: buildPrompt(question, hits) },
+    ],
+  }),
+});
+```
+
+The retrieved chunks and their distances are printed *before* the answer on
+purpose: a bad answer is then immediately diagnosable — wrong chunks means a
+retrieval problem; right chunks but a wrong reading means a generation problem.
 
 ---
 
@@ -677,10 +793,10 @@ That last row is the one to watch. Similarity search **always** returns somethin
 `ORDER BY ... LIMIT 3` can't return "nothing relevant." Asking this corpus
 *"how do I bake sourdough bread"* still returns three chunks; they just sit
 above 0.8. Nothing in the *ranking* tells you the answer isn't
-there — only the absolute distance does. This is exactly why a relevance
-threshold matters before you hand results to an LLM, which would otherwise
-cheerfully try to answer a bread question from a Postgres manual (see
-[section 14](#14-where-to-go-next)).
+there — only the absolute distance does. `ask.ts` defends against this with
+its grounding prompt — the LLM says "I don't know" when the chunks don't
+contain the answer — but a hard relevance threshold *before* prompting is the
+stronger fix (see [section 14](#14-where-to-go-next)).
 
 ---
 
@@ -727,12 +843,12 @@ words — is the entire reason vector search (and RAG) works.**
 
 ## 14. Where to go next
 
-This project implements **retrieval**. To extend it:
+The full RAG loop now runs end-to-end. To extend it:
 
-- **Complete the RAG loop (add "Generation"):** feed the top-3 chunks to an LLM
-  as context and ask it to answer the user's question using only them. That turns
-  *retrieval* into *retrieval-augmented generation*. Pair it with the threshold
-  below, and instruct the model to say "not in the docs" rather than guess.
+- ~~**Complete the RAG loop (add "Generation")**~~ — **done**: `src/ask.ts`
+  feeds the top-3 chunks to a local LLM under grounding rules. Its own next
+  steps: pair it with the threshold below, or swap `llama3.2` for a bigger
+  model — everything model-specific lives in one `generate()` function.
 - **Add a relevance threshold:** drop results above ~0.7 distance, so an
   unanswerable query returns "no good match" instead of the least-bad chunk.
 - **Store chunk metadata:** add `source` and `chunk_index` columns so results can
