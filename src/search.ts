@@ -1,4 +1,4 @@
-// Step 8 — Searching.
+// Step 8 — Searching (Retrieve).
 //
 // A user query is NOT matched as text. Instead:
 //     query text  ->  embed()  ->  query vector
@@ -6,15 +6,23 @@
 // and returns the closest ones (smallest distance = most similar meaning).
 //
 // Run with:  npm run search "how can I build a caching server?"
+//
+// This file also exports `search()` so ask.ts can reuse retrieval as the
+// first half of the full RAG loop (retrieve -> prompt -> LLM -> answer).
 
 import "dotenv/config"; // loads DATABASE_URL from .env
 import { Client } from "pg";
 import { embed } from "./embed.js"; // the SAME embedder used to index the documents
 import { chunkLabel } from "./chunk.js"; // just for pretty console labels
 
-const TOP_K = 3; // how many similar snippets to return
+export const TOP_K = 3; // how many similar chunks to return
 
-async function search(query: string) {
+export interface SearchHit {
+  content: string;
+  distance: number;
+}
+
+export async function search(query: string, topK: number = TOP_K): Promise<SearchHit[]> {
   const db = new Client({ connectionString: process.env.DATABASE_URL });
   await db.connect();
 
@@ -32,34 +40,41 @@ async function search(query: string) {
      FROM documents
      ORDER BY distance
      LIMIT $2`,
-    [queryLiteral, TOP_K]
+    [queryLiteral, topK]
   );
 
   await db.end();
-  return result.rows as { content: string; distance: number }[];
+  return result.rows as SearchHit[];
 }
 
-// Take the query from the command line, or use a default.
-const query =
-  process.argv.slice(2).join(" ") || "How can I build a caching server?";
+// Only run the CLI below when this file is executed directly (`npm run search`).
+// When ask.ts imports `search`, this block is skipped — same pattern as embed.ts.
+import { fileURLToPath } from "node:url";
+const isDirectRun = process.argv[1] === fileURLToPath(import.meta.url);
 
-search(query)
-  .then((rows) => {
-    console.log(`\n🔎 Query: "${query}"\n`);
-    console.log(`Top ${rows.length} most similar chunks:\n`);
-    rows.forEach((row, i) => {
-      const distance = Number(row.distance).toFixed(4);
-      console.log(`${i + 1}. [distance ${distance}]  ${chunkLabel(row.content)}`);
-      // Chunks are multi-line markdown, so indent the whole block.
-      console.log(
-        row.content
-          .split("\n")
-          .map((line) => `   ${line}`)
-          .join("\n") + "\n",
-      );
+if (isDirectRun) {
+  // Take the query from the command line, or use a default.
+  const query =
+    process.argv.slice(2).join(" ") || "How can I build a caching server?";
+
+  search(query)
+    .then((rows) => {
+      console.log(`\n🔎 Query: "${query}"\n`);
+      console.log(`Top ${rows.length} most similar chunks:\n`);
+      rows.forEach((row, i) => {
+        const distance = Number(row.distance).toFixed(4);
+        console.log(`${i + 1}. [distance ${distance}]  ${chunkLabel(row.content)}`);
+        // Chunks are multi-line markdown, so indent the whole block.
+        console.log(
+          row.content
+            .split("\n")
+            .map((line) => `   ${line}`)
+            .join("\n") + "\n",
+        );
+      });
+    })
+    .catch((err) => {
+      console.error("Search error:", err);
+      process.exit(1);
     });
-  })
-  .catch((err) => {
-    console.error("Search error:", err);
-    process.exit(1);
-  });
+}
