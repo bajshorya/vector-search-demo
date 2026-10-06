@@ -1,29 +1,32 @@
-// Step 10 — Generation: the second half of RAG.
+// Step 10 — Generation: the second half of RAG.  (Hardened in steps 11–12.)
 //
-// search.ts stops at "here are the 3 most similar chunks". This file finishes
+// search.ts stops at "here are the most similar chunks". This file finishes
 // the pipeline:
 //
-//     question  ->  search()   ->  top chunks          (Retrieve — already built)
-//               ->  buildPrompt()                      (Prompt + Context)
-//               ->  Ollama (llama3.2, local)           (LLM)
-//               ->  grounded answer + cited sources    (Answer)
+//     question  ->  retrieveAndRerank()  ->  best chunks     (Retrieve + Re-rank)
+//               ->  buildPrompt()                            (Prompt + Context)
+//               ->  chat()  (Ollama llama3.2, local)         (LLM — timed out + retried)
+//               ->  grounded answer + cited sources          (Answer)
 //
-// Like the embeddings, the LLM runs entirely on this machine: Ollama serves
-// llama3.2 at http://localhost:11434. No API key, no cost, works offline.
+// What changed when we hardened it:
+//   - Retrieval now pulls a wider set and RE-RANKS it (rerank.ts) before
+//     building the prompt, so the model sees fewer, more relevant chunks.
+//   - The LLM call goes through llm.ts: it has a timeout, it retries transient
+//     failures with backoff, and it returns a Result instead of throwing — so a
+//     hung or failing model degrades to a clear message, not a stack trace.
 //
-// The grounding rule is what makes this RAG and not just a chatbot: the model
-// is instructed to answer ONLY from the retrieved chunks, and to say it
-// doesn't know when they don't contain the answer. The knowledge lives in
-// Postgres; the model just reads and phrases it.
+// The grounding rule is unchanged and is what makes this RAG and not just a
+// chatbot: the model answers ONLY from the retrieved chunks and says it doesn't
+// know when they don't contain the answer.
 //
 // Run with:  npm run ask "how do I choose chunk size and overlap?"
 
 import "dotenv/config"; // loads DATABASE_URL from .env
-import { search, TOP_K, type SearchHit } from "./search.js"; // reuse retrieval — same embedder, same table
+import { retrieveAndRerank, type RankedHit } from "./rerank.js";
+import { chat } from "./llm.js";
 import { chunkLabel } from "./chunk.js";
 
-const OLLAMA_URL = "http://localhost:11434/api/chat";
-const MODEL = "llama3.2"; // 3B model, ~2GB, already pulled via `ollama pull llama3.2`
+const MODEL = "llama3.2";
 
 // The system prompt carries the grounding rule. It never changes per question.
 const SYSTEM_PROMPT = `You are a helpful assistant answering questions about a codebase, using ONLY the context chunks provided in the user's message.
@@ -39,7 +42,7 @@ Rules:
  * wrapped in a tagged block so the model can tell chunk boundaries apart and
  * cite them by id. The question goes last.
  */
-function buildPrompt(question: string, hits: SearchHit[]): string {
+function buildPrompt(question: string, hits: RankedHit[]): string {
   const context = hits
     .map((hit, i) => `<chunk id="${i + 1}">\n${hit.content}\n</chunk>`)
     .join("\n\n");
@@ -47,58 +50,44 @@ function buildPrompt(question: string, hits: SearchHit[]): string {
   return `<context>\n${context}\n</context>\n\nQuestion: ${question}`;
 }
 
-/**
- * Call the local Ollama server and stream the answer to stdout as it's
- * generated. Ollama's /api/chat returns NDJSON: one JSON object per line,
- * each carrying the next fragment of the reply in .message.content.
- */
-async function generate(question: string, hits: SearchHit[]): Promise<void> {
-  const response = await fetch(OLLAMA_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: MODEL,
-      stream: true,
-      messages: [
-        { role: "system", content: SYSTEM_PROMPT },
-        { role: "user", content: buildPrompt(question, hits) },
-      ],
-    }),
-  });
-
-  if (!response.ok || !response.body) {
-    throw new Error(`Ollama returned ${response.status}: ${await response.text()}`);
-  }
-
-  // Read the NDJSON stream line by line, printing each text fragment.
-  const decoder = new TextDecoder();
-  let buffer = "";
-  for await (const chunk of response.body) {
-    buffer += decoder.decode(chunk as Uint8Array, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? ""; // keep any incomplete trailing line
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      const part = JSON.parse(line);
-      if (part.message?.content) process.stdout.write(part.message.content);
-    }
-  }
-  process.stdout.write("\n");
-}
-
 async function ask(question: string) {
-  // ---- Retrieve (built in step 8) ----
-  const hits = await search(question, TOP_K);
+  // ---- Retrieve + Re-rank (steps 8 & 12) ----
+  const retrieved = await retrieveAndRerank(question);
+  if (!retrieved.ok) {
+    // Re-rank degrades gracefully on its own, so this is only reached on a hard
+    // failure. Report it and stop rather than guessing.
+    console.error(`\n❌ Retrieval failed: ${retrieved.error.message}`);
+    process.exit(1);
+  }
+  const hits = retrieved.value;
 
   console.log(`\n🔎 Question: "${question}"`);
-  console.log(`📚 Retrieved ${hits.length} chunks:`);
+  console.log(`📚 Using ${hits.length} chunks (after re-ranking):`);
   hits.forEach((hit, i) => {
-    console.log(`   [${i + 1}] (distance ${Number(hit.distance).toFixed(4)}) ${chunkLabel(hit.content)}`);
+    const score = hit.rerankScore != null ? `score ${hit.rerankScore}/10, ` : "";
+    console.log(`   [${i + 1}] (${score}distance ${Number(hit.distance).toFixed(4)}) ${chunkLabel(hit.content)}`);
   });
   console.log(`\n🤖 ${MODEL} (local via Ollama):\n`);
 
-  // ---- Prompt + Context -> LLM -> Answer ----
-  await generate(question, hits);
+  // ---- Prompt + Context -> LLM -> Answer (timed out + retried) ----
+  const answer = await chat([
+    { role: "system", content: SYSTEM_PROMPT },
+    { role: "user", content: buildPrompt(question, hits) },
+  ]);
+
+  if (!answer.ok) {
+    // The error is already classified (operational vs programmer) by llm.ts.
+    const { kind, message } = answer.error;
+    console.error(`❌ Could not generate an answer (${kind} error): ${message}`);
+    if (kind === "operational") {
+      console.error("   This looks transient — check that `ollama serve` is running and try again.");
+    } else {
+      console.error("   This looks like a bug in the request — retrying won't help; check the code.");
+    }
+    process.exit(1);
+  }
+
+  process.stdout.write(answer.value + "\n");
 
   // Show which chunks fed the answer, so the grounding is inspectable.
   console.log(`\n— sources: ${hits.map((h, i) => `[${i + 1}] ${chunkLabel(h.content)}`).join("  ·  ")}`);
@@ -108,14 +97,6 @@ const question =
   process.argv.slice(2).join(" ") || "How do I choose the chunk size and overlap?";
 
 ask(question).catch((err) => {
-  if (err instanceof TypeError && String(err.cause ?? "").includes("ECONNREFUSED")) {
-    console.error(
-      "\n❌ Can't reach Ollama at localhost:11434.\n" +
-        "   Start it with:  ollama serve\n" +
-        "   (and make sure the model is pulled:  ollama pull llama3.2)",
-    );
-  } else {
-    console.error("Ask error:", err);
-  }
+  console.error("Ask error:", err);
   process.exit(1);
 });

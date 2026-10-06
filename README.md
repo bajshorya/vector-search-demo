@@ -56,21 +56,28 @@ The project is split into two phases, matching how every RAG system works.
 - Convert it into an embedding using the **same** model.
 - Ask PostgreSQL for the chunks whose embeddings are **closest** to the
   question's embedding.
-- Return the top 3.
+- Return the top 10 candidates.
 
 That's the "R" (Retrieval) in RAG — `npm run search` stops there so you can
 inspect the raw chunks and distances.
 
-**Online (every question) — generate a grounded answer:**
+**Online (every question) — re-rank, then generate a grounded answer:**
 
-- `npm run ask` runs the same retrieval, then wraps the top-3 chunks in a
-  prompt with strict grounding rules.
-- A **local LLM** (`llama3.2` served by Ollama) answers **only from those
-  chunks**, citing them inline as [1] [2] [3] — or replies *"I don't know based
-  on the indexed documents"* when they don't contain the answer.
+- `npm run ask` retrieves the top 10, then **re-ranks** them: one LLM scoring
+  call rates each chunk 1–10 for how well it actually answers the question, and
+  the best 4 are kept (`npm run rerank` shows this before/after). This fixes the
+  "closest isn't most useful" problem — a chunk can sit close in vector space
+  just by repeating the question's words.
+- It then wraps those 4 chunks in a prompt with strict grounding rules and asks a
+  **local LLM** (`llama3.2` served by Ollama) to answer **only from those
+  chunks**, citing them inline as [1] [2] — or reply *"I don't know based on the
+  indexed documents"* when they don't contain the answer.
+- The LLM call is **hardened**: a timeout, automatic retries with backoff, and
+  typed errors, so a slow or failing model degrades to a clear message, not a
+  stack trace.
 
 That's the "G" (Generation): the knowledge lives in Postgres, the LLM only
-reads and phrases it.
+reads and phrases it. (`npm run eval` checks both halves over known questions.)
 
 ---
 
@@ -197,17 +204,24 @@ ONLINE  (every question: `npm run ask "..."`)
    384-number query vector
           │
           ▼
-   SELECT ... ORDER BY embedding <=> queryVector LIMIT 3   ──►  PostgreSQL
+   SELECT ... ORDER BY embedding <=> queryVector LIMIT 10  ──►  PostgreSQL
           │
           ▼
-   top 3 most similar chunks     ◄── `npm run search` stops here (Retrieve)
+   top 10 candidate chunks       ◄── `npm run search` stops here (Retrieve)
+          │
+          ▼
+   retrieveAndRerank()  (src/rerank.ts — one LLM scoring call rates each chunk
+          │              1–10 for usefulness; keep the best 4. Falls back to
+          │              vector order if the scoring call fails.)
+          ▼
+   top 4 re-ranked chunks        ◄── `npm run rerank` shows before/after
           │
           ▼
    buildPrompt()     (src/ask.ts — chunks wrapped in <chunk id="n"> tags,
           │           grounding rules, the question last)
           ▼
-   llama3.2          (local LLM served by Ollama at localhost:11434)
-          │
+   chat()            (src/llm.ts — llama3.2 via Ollama at localhost:11434,
+          │           behind a timeout + retry-with-backoff)
           ▼
    grounded, cited answer — or "I don't know" if the chunks lack it
 ```
@@ -263,14 +277,22 @@ vector-search-demo/
 ├── src/
 │   ├── chunk.ts      # Splits a document into overlapping chunks. Exports chunkText().
 │   ├── embed.ts      # OFFLINE: chunks README.md, embeds each chunk, stores it. Exports embed().
-│   ├── search.ts     # ONLINE: embeds a query + finds the top 3 matching chunks. Exports search().
-│   ├── ask.ts        # ONLINE: full RAG — retrieval + a grounded answer from a local LLM.
+│   ├── search.ts     # ONLINE: embeds a query + finds the top matching chunks. Exports search().
+│   ├── result.ts     # Generic Result<T, E> — errors as values, checked by the compiler.
+│   ├── llm.ts        # Hardened Ollama client: timeout, retry+backoff, typed errors. Exports chat() + chatWithTools().
+│   ├── rerank.ts     # ONLINE: retrieve 10, LLM-score them, keep the best 4. Exports retrieveAndRerank().
+│   ├── ask.ts        # ONLINE: full RAG — retrieve + re-rank + a grounded answer from a local LLM.
+│   ├── bookmarks.ts  # Mock bookmarks store (the data source behind the tools). Exports get/add/countBookmarks().
+│   ├── tool-ask.ts   # ONLINE: the tool-calling agent loop — 3 Zod-validated bookmark tools.
+│   ├── tool-ask.test.ts # Tests for the tool layer (node:test): validation, parallel calls, errors.
+│   ├── eval.ts       # 6-question pass/fail harness over the real pipeline.
 │   └── snippets.ts   # The OLD hand-written corpus. No longer used — kept for reference.
 ├── .env              # DATABASE_URL (no API key needed). Not committed.
 ├── .gitignore        # ignores node_modules/ and .env
-├── package.json      # deps + `npm run embed` / `npm run search` scripts
+├── package.json      # deps + embed / search / rerank / ask / tools / eval / test scripts
 ├── tsconfig.json     # TypeScript config
 ├── README.md         # this file — and also the document being indexed
+├── HARDENING.md      # why/how the pipeline was hardened (re-rank, llm, eval)
 └── DOCUMENTATION.md  # deep-dive docs: every file and function explained
 ```
 
@@ -296,7 +318,7 @@ Table "public.documents"
 - **Node.js** (v18+; v20+ recommended)
 - **PostgreSQL** (v14+ used here)
 - **pgvector** extension installed for your PostgreSQL version
-- **Ollama** with the `llama3.2` model (only for `npm run ask` — search works without it)
+- **Ollama** with the `llama3.2` model (needed for `npm run rerank`, `ask`, and `eval` — `npm run search` works without it)
 
 ---
 
@@ -435,28 +457,53 @@ the best match for a good query was ~0.58. With chunks, well-targeted queries
 land in the 0.34–0.45 range — because a chunk's vector represents *one* topic
 instead of averaging eight.
 
-### Step 3 — Ask (the full RAG loop, any time)
+### Step 3 — Re-rank (see "closest" vs "most useful", any time)
+
+```bash
+npm run rerank "why do we use overlap between chunks?"
+```
+
+This retrieves the top 10 by vector distance, then spends one LLM scoring call to
+rate each chunk's usefulness 1–10, and prints both orders side by side so you can
+*see* re-ranking move the genuinely useful chunk up past a mere keyword match:
+
+```
+Stage 1 — top 10 by vector distance:
+   #1  d=0.4430  Choosing size and overlap           ← keyword match, not the answer
+   #3  d=0.4536  `src/embed.ts` — build the knowledge base
+   ...
+Stage 2 — kept top 4 after LLM re-ranking:
+   #1  score=10/10  d=0.4536  `src/embed.ts` — build the knowledge base   ← promoted
+   ...
+```
+
+If the scoring call fails or returns bad JSON, it falls back to the top 4 by
+distance — re-ranking is a quality boost, not a correctness requirement.
+
+### Step 4 — Ask (the full RAG loop, any time)
 
 ```bash
 npm run ask "how do I choose the chunk size and overlap?"
 ```
 
-This runs the same retrieval as Step 2, then hands the top 3 chunks to
-`llama3.2` with strict grounding rules and streams the answer:
+This retrieves the top 10 (Step 2), re-ranks to the best 4 (Step 3), then hands
+those chunks to `llama3.2` with strict grounding rules and prints the answer
+(taken as a whole reply, behind a timeout and automatic retries):
 
 ```
 🔎 Question: "how do I choose the chunk size and overlap?"
-📚 Retrieved 3 chunks:
-   [1] (distance 0.5345) 4. Architecture & data flow
-   [2] (distance 0.5461) start a new one. Because we only ever a…
-   [3] (distance 0.5866) Choosing size and overlap
+📚 Using 4 chunks (after re-ranking):
+   [1] (score 10/10, distance 0.5652) -> "I don't know based on the indexed d…
+   [2] (score  9/10, distance 0.5345) 4. Architecture & data flow
+   [3] (score  9/10, distance 0.5675) -> section 3 "Choosing size and overlap…
+   [4] (score  9/10, distance 0.5866) Choosing size and overlap
 
 🤖 llama3.2 (local via Ollama):
 
-According to chunk 3, ... Chunk size: 900 chars (~225 tokens),
-Overlap: 150 chars (~17%) ... [3]
+According to chunk 3, [3], the recommended chunk size is 900 chars (~225 tokens),
+and the recommended overlap is 150 chars (~17%).
 
-— sources: [1] 4. Architecture & data flow  ·  [2] …  ·  [3] Choosing size and overlap
+— sources: [1] …  ·  [2] 4. Architecture & data flow  ·  [3] …  ·  [4] Choosing size and overlap
 ```
 
 The grounding is testable: ask something this README doesn't cover, and the
@@ -470,6 +517,87 @@ npm run ask "what is the capital of France?"
 
 llama3.2 obviously *knows* the answer — the refusal proves the response comes
 from the retrieved chunks, not from the model's memory.
+
+### Step 5 — Tool calling (let the model run your code)
+
+```bash
+npm run tools "how many bookmarks do I have, and which are tagged rag?"
+```
+
+RAG (Step 4) answers from text you *retrieved and pasted in*. Tool calling is a
+different LLM mode: you hand the model some **tools** it can choose to call, it
+asks for calls, **your** code runs them, you feed the results back, and it loops
+until it returns a plain-text answer:
+
+```
+user question → LLM → (tool calls?) → your code runs them → tool results
+              → LLM → … → final text answer
+```
+
+This demo wires up three tools over a mock bookmarks store (`bookmarks.ts`):
+
+- `get_bookmarks(tag)` — list bookmarks filed under a tag
+- `add_bookmark(url, title, tags)` — save a new bookmark
+- `count_bookmarks()` — total count
+
+Every call's arguments are validated with **Zod** before running, every tool
+error is caught and returned to the model as a readable result (never a crash),
+unknown/hallucinated tool names are handled, and the loop is capped at 5
+iterations. Each step is logged so you can watch the loop:
+
+```
+👤 User message: "how many bookmarks do I have, and which are tagged rag?"
+
+🔧 2 tool call(s) requested (iteration 1):
+   ✓ count_bookmarks({})
+      result: {"count":5}
+   ✓ get_bookmarks({"tag":"rag"})
+      result: [{"title":"pgvector…","url":"https://github.com/pgvector/pgvector","tags":["postgres","vector","rag"]}, …]
+
+✅ Final answer (iteration 2):
+
+You have a total of 5 bookmarks. The bookmarks tagged "rag" are:
+* pgvector: open-source vector similarity search for Postgres — https://github.com/pgvector/pgvector
+* Chunking strategies for RAG — https://www.pinecone.io/learn/chunking-strategies/
+```
+
+The model may ask for several tools at once (as above); the loop runs **all** of
+them and returns one result per call. Tool calling is independent of the RAG
+pipeline — it reuses only the hardened LLM transport in `llm.ts`
+(`chatWithTools()`), so neither feature can break the other.
+
+Run the tool-layer tests with:
+
+```bash
+npm test
+```
+
+They cover the five scenarios deterministically (a no-tool turn, one tool,
+multiple/parallel tools, invalid arguments, an unknown tool) plus two live
+end-to-end checks that are skipped automatically when Ollama isn't running.
+
+### Step 6 — Eval (check the whole pipeline over known questions)
+
+```bash
+npm run eval
+```
+
+This runs the real pipeline (retrieve → re-rank → generate) against 6 questions
+whose answers are known, and checks the two things that matter most in RAG:
+does it **answer** when the README can, and does it **decline** ("I don't know")
+when it can't? Half the cases are deliberately unanswerable. It logs the
+question, the chunks, the answer, and a pass/fail for each, then a final score:
+
+```
+✅ PASS  Q: What is the default chunk size in characters?
+❌ FAIL  Q: Why do we use overlap between chunks at all?   (answered, but missed expected keywords)
+✅ PASS  Q: What is the capital of France?                 (correctly declined)
+...
+Score: 5/6 passed.
+```
+
+The pass/fail is a crude keyword heuristic, not ground truth — a correct answer
+phrased differently can still "fail". Read the answers; don't just trust the ✅.
 
 ### A self-reference artifact worth understanding
 
@@ -485,13 +613,15 @@ that question. But it's useless as an answer, and it's a real failure mode in
 production RAG: FAQ pages, changelogs, and support-ticket archives are full of
 text that echoes user questions without resolving them.
 
-Two standard mitigations, neither implemented here:
+Two standard mitigations:
 
 - **Retrieve more, then re-rank.** Pull the top 10 by vector distance, then score
   them with a cross-encoder or an LLM on *"does this actually answer the
-  question?"* — a judgement pure vector distance cannot make.
+  question?"* — a judgement pure vector distance cannot make. **This is now
+  implemented** in `src/rerank.ts` (`npm run rerank`); it's the re-rank stage of
+  the pipeline above.
 - **Exclude the wrong material at index time.** Don't chunk the sections that
-  only demonstrate queries.
+  only demonstrate queries. (Not done here — kept so this artifact stays visible.)
 
 It also explains why the numbers in this README drift: the examples are part of
 the corpus they describe. Change one and you change the results it reports.
@@ -703,14 +833,15 @@ export async function search(query: string, topK: number = TOP_K) {
 
 ### `src/ask.ts` — generate the answer
 
-The generation half of RAG. It reuses `search()` for retrieval, then does three
-things:
+The generation half of RAG. Since hardening it's thin glue: it calls
+`retrieveAndRerank()` for the chunks, builds a prompt, calls `chat()`, and
+handles the `Result` from each. Three pieces matter:
 
 **1. Prompt + Context.** The chunks are wrapped in tagged blocks so the model
 can tell them apart and cite them by id, with the question placed last:
 
 ```ts
-function buildPrompt(question: string, hits: SearchHit[]): string {
+function buildPrompt(question: string, hits: RankedHit[]): string {
   const context = hits
     .map((hit, i) => `<chunk id="${i + 1}">\n${hit.content}\n</chunk>`)
     .join("\n\n");
@@ -723,29 +854,34 @@ claim on the context, cite chunks inline as [1]/[2], and say *"I don't know
 based on the indexed documents"* instead of guessing. This is the line between
 RAG and a plain chatbot: the model's own knowledge is deliberately off-limits.
 
-**3. The LLM call.** Plain `fetch` to Ollama's `/api/chat` on localhost — no
-SDK. With `stream: true`, Ollama replies with NDJSON (one JSON object per
-line, each carrying a few tokens); the code buffers partial lines and prints
-fragments as they arrive, so the answer streams word by word:
+**3. The LLM call.** All LLM access goes through `chat()` in `src/llm.ts`, which
+wraps Ollama's `/api/chat` with a timeout, retry-with-backoff, and typed errors,
+returning a `Result<string, LLMError>` instead of throwing:
 
 ```ts
-const response = await fetch("http://localhost:11434/api/chat", {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({
-    model: "llama3.2",
-    stream: true,
-    messages: [
-      { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: buildPrompt(question, hits) },
-    ],
-  }),
-});
+const answer = await chat([
+  { role: "system", content: SYSTEM_PROMPT },
+  { role: "user", content: buildPrompt(question, hits) },
+]);
+
+if (!answer.ok) {
+  // error is already classified operational (retry) vs programmer (bug)
+  const { kind, message } = answer.error;
+  console.error(`❌ Could not generate an answer (${kind} error): ${message}`);
+  process.exit(1);
+}
+process.stdout.write(answer.value + "\n");
 ```
 
-The retrieved chunks and their distances are printed *before* the answer on
-purpose: a bad answer is then immediately diagnosable — wrong chunks means a
-retrieval problem; right chunks but a wrong reading means a generation problem.
+The call is **non-streaming** on purpose: streaming is incompatible with clean
+retries (a retry that already printed half an answer would double up), so the
+hardened client takes the whole reply atomically, then prints it.
+
+The kept chunks, their re-rank scores, and their distances are printed *before*
+the answer on purpose: a bad answer is then immediately diagnosable — wrong
+chunks means a retrieval problem; right chunks but a wrong reading means a
+generation problem. See **HARDENING.md** for the full rationale behind the
+re-rank, the `Result` type, and the retry logic.
 
 ---
 
@@ -843,12 +979,24 @@ words — is the entire reason vector search (and RAG) works.**
 
 ## 14. Where to go next
 
-The full RAG loop now runs end-to-end. To extend it:
+The full RAG loop runs end-to-end and has been hardened (re-rank, a resilient LLM
+client, and an eval — see **HARDENING.md**). Already done:
 
 - ~~**Complete the RAG loop (add "Generation")**~~ — **done**: `src/ask.ts`
-  feeds the top-3 chunks to a local LLM under grounding rules. Its own next
-  steps: pair it with the threshold below, or swap `llama3.2` for a bigger
-  model — everything model-specific lives in one `generate()` function.
+  feeds the re-ranked chunks to a local LLM under grounding rules.
+- ~~**Re-rank the results**~~ — **done**: `src/rerank.ts` retrieves the top 10
+  and uses one LLM scoring call to keep the best 4, fixing the
+  question-matches-question artifact in [section 9](#a-self-reference-artifact-worth-understanding).
+- ~~**Harden the LLM call**~~ — **done**: `src/llm.ts` adds a timeout,
+  retry-with-backoff, and typed `Result` errors.
+- ~~**Evaluate it**~~ — **started**: `src/eval.ts` runs a 6-question pass/fail
+  harness over the real pipeline.
+- ~~**Add tool calling**~~ — **done**: `src/tool-ask.ts` (`npm run tools`) adds a
+  tool-calling agent loop with three Zod-validated bookmark tools, reusing the
+  hardened LLM client via `chatWithTools()`. See [Step 5](#step-5--tool-calling-let-the-model-run-your-code).
+
+Still open:
+
 - **Add a relevance threshold:** drop results above ~0.7 distance, so an
   unanswerable query returns "no good match" instead of the least-bad chunk.
 - **Store chunk metadata:** add `source` and `chunk_index` columns so results can
@@ -856,11 +1004,12 @@ The full RAG loop now runs end-to-end. To extend it:
   more than one file.
 - **Index more documents:** the pipeline is file-agnostic. Glob a directory,
   chunk every file, and store them all — nothing else changes.
-- **Re-rank the results** with a cross-encoder or an LLM, to fix the
-  question-matches-question artifact described in [section 9](#a-self-reference-artifact-worth-understanding).
+- **Swap the LLM or embedder:** everything model-specific lives in `src/llm.ts`
+  (`OLLAMA_URL`, `MODEL`) and `embed()` in `src/embed.ts`. Point at a bigger
+  Ollama model or a hosted API (e.g. OpenAI `text-embedding-3-small`, 1536 dims);
+  for a new embedder, also update the `VECTOR(n)` column dimension and re-index.
 - **Add a vector index** for speed on large corpora:
   `CREATE INDEX ON documents USING hnsw (embedding vector_cosine_ops);`
-  (Irrelevant at 40 rows; essential at 100k+.)
-- **Try a bigger model / hosted API** (e.g. OpenAI `text-embedding-3-small`,
-  1536 dims) if you want higher-quality embeddings and a larger input window —
-  change `embed()` and the column dimension.
+  (Irrelevant at this scale; essential at 100k+.)
+- **Grow the eval:** log results to JSONL over time, or replace the keyword
+  heuristic with a separate LLM judge.
